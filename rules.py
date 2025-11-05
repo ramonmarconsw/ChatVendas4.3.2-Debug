@@ -168,7 +168,7 @@ SCHEMA_INFO = {
     "VW_DEVOLUCAO_LAB": {
         "descricao": "View usada para exemplos de volume (área), faturamento, top clientes",
         "colunas": {
-            "CIDADE": "Cidade / planta (usuária para agrupamento)",
+            "CIDADE": "Cidade / planta (usada para agrupamento)",
             "AREA": "Área relacionada à devolução / venda (m²)",
             "DATA_EMISSAO": "Data de emissão do documento (datetime)",
             # Se a view tiver coluna de cliente, assumimos NOME_CLI; caso contrário adapte o exemplo
