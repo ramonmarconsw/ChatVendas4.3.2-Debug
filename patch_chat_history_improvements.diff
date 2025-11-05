@@ -1,0 +1,310 @@
+--- a/app.py
++++ b/app.py
+@@ -21,7 +21,7 @@
+ 
+ from db import (
+     try_connect, odbc_conn_str_windows, fetch_tables_and_columns_cached,
+-    schema_to_text, run_query
++    schema_to_text, run_query, insert_chat_turn
+ )
+ from rules import SCHEMA_INFO, METRIC_RULES, EXEMPLOS_SQL
+ from llm import montar_prompt, call_azure_openai_completion, extract_sql, metric_hints_for_question
+@@ -90,6 +90,11 @@
+ st.title("Radar IA")
+ 
+ # Estado inicial
++if "session_id" not in st.session_state: st.session_state.session_id = st.session_state.get("session_id") or __import__("uuid").uuid4().hex[:12]
++# Orçamento padrão de tokens para histórico
++if "history_token_budget" not in st.session_state: st.session_state.history_token_budget = 3000
++# Último índice de df aberto
++
+ if "conn_str" not in st.session_state: st.session_state.conn_str = None
+ if "connected" not in st.session_state: st.session_state.connected = False
+ if "schema_text" not in st.session_state: st.session_state.schema_text = None
+@@ -122,7 +127,7 @@
+ 
+ for idx, m in enumerate(msgs):
+     role = m.get("role", "assistant")
+-    display_role = "assistant"  # unificar estilo sem cores/ícones
++    display_role = "user" if role == "user" else "assistant"  # papéis corretos na UI
+     label = "Pergunta:" if role == "user" else "Resposta:"
+     mtype = m.get("type")
+     # Evita bolha vazia para SQL quando oculto
+@@ -173,47 +178,132 @@
+     return f"Foram retornadas {nrows:,} linha(s). Exemplo de registro — {example}."
+ 
+ # Constrói um contexto curto da conversa (últimos N turnos)
+-def build_chat_context(max_turns: int = 3) -> str:
+-    ctx = []
+-    user_turns = 0
+-    # percorre do fim para o início
++
++def _approx_tokens(text: str) -> int:
++    # Estimativa simples ~4 chars por token
++    return max(1, int(len(text) / 4))
++
++def _mask_value(val):
++    try:
++        s = str(val)
++    except Exception:
++        return val
++    if s is None:
++        return s
++    # Máscaras simples: e-mail, CPF, nomes longos
++    if "@" in s:
++        user, _, dom = s.partition("@")
++        return (user[:1] + "***@" + dom) if user else "***@" + dom
++    if s.isdigit() and len(s) in (11, 14):
++        return s[:3] + "****" + s[-2:]
++    if len(s) > 16:
++        return s[:8] + "…"
++    return s
++
++def _mask_df_for_context(df: pd.DataFrame, whitelist_cols=None, pii_col_patterns=None, max_rows=2, max_cols=5) -> str:
++    if df is None or df.empty:
++        return ""
++    cols = list(df.columns)
++    wl = whitelist_cols or []
++    # prioriza colunas whitelisted; se vazio, usa primeiras colunas
++    chosen = [c for c in cols if c in wl][:max_cols] if wl else cols[:max_cols]
++    df_small = df[chosen].head(max_rows).copy()
++    # aplica máscara em colunas sensíveis
++    patterns = pii_col_patterns or ["NOME", "CLI", "EMAIL", "CPF", "CNPJ"]
++    for c in df_small.columns:
++        if any(pat.lower() in c.lower() for pat in patterns):
++            df_small[c] = df_small[c].map(_mask_value)
++        else:
++            # também limita comprimento de célula no contexto
++            df_small[c] = df_small[c].map(lambda v: (str(v)[:24] + "…") if isinstance(v, str) and len(v) > 24 else v)
++    try:
++        return df_small.to_csv(index=False)
++    except Exception:
++        return ""
++
++def build_chat_context(max_tokens: int = None) -> str:
++    """Monta contexto *token-aware*.
++    Blocos e tetos:
++      - Resumo de resposta: até 400 tokens acumulados
++      - Última SQL válida: 1 bloco
++      - Mini-CSV: até 2 linhas x 5 colunas, com mascaramento de PII
++      - Últimos turnos do usuário completos até estourar o orçamento
++    """
++    budget = int(max_tokens or st.session_state.get("history_token_budget", 3000))
++    used = 0
++    ctx_blocks = []
++
++    # percorre do fim para o início e acumula
++    last_sql_added = False
++    user_turns_text = []
++    summary_tokens = 0
++    MAX_SUMMARY_TOKENS = 400
++
+     for m in reversed(st.session_state.messages):
+         role = m.get("role")
+         mtype = m.get("type")
+-        # Perguntas do usuário
++
+         if role == "user":
+-            ctx.append(f"Usuário: {m.get('content','').strip()}")
+-            user_turns += 1
+-            if user_turns >= max_turns:
++            text = (m.get("content") or "").strip()
++            if not text:
++                continue
++            block = f"Usuário: {text}"
++            t = _approx_tokens(block)
++            if used + t > budget:
+                 break
+-        # Respostas do assistente (preferindo resumo + SQL, não a tabela inteira)
++            user_turns_text.append(block)
++            used += t
+         else:
+             if mtype == "dataframe":
++                df = m.get("content")
+                 summary = (m.get("summary") or "").strip()
+-                df = m.get("content")
+-                # Mini-amostra (3 primeiras linhas) ajuda follow-ups do tipo "e ordene por..."
+-                mini_csv = ""
+-                if df is not None:
+-                    try:
+-                        mini_csv = df.head(3).to_csv(index=False)
+-                    except Exception:
+-                        mini_csv = ""
+-                bloco = "Assistente: "
+-                if summary:
+-                    bloco += f"resumo={summary}\n"
++                parts = []
++                if summary and summary_tokens < MAX_SUMMARY_TOKENS:
++                    add = summary[:1000]
++                    t = _approx_tokens(add)
++                    if summary_tokens + t > MAX_SUMMARY_TOKENS:
++                        # corta
++                        remain = MAX_SUMMARY_TOKENS - summary_tokens
++                        chars = max(0, remain * 4)
++                        add = add[:chars]
++                        t = _approx_tokens(add)
++                    parts.append(f"Assistente: resumo={add}")
++                    summary_tokens += t
++                    used += t
++                # mini-csv mascarado
++                mini_csv = _mask_df_for_context(
++                    df, whitelist_cols=[], pii_col_patterns=["NOME","CLI","EMAIL","CPF","CNPJ"], max_rows=2, max_cols=5
++                ) if isinstance(df, pd.DataFrame) else ""
+                 if mini_csv:
+-                    bloco += f"Amostra CSV (até 3 linhas):\n{mini_csv}"
+-                ctx.append(bloco.strip())
+-            elif mtype == "sql":
++                    block = f"Amostra CSV (até 2 linhas, mascarado):
++{mini_csv}"
++                    t = _approx_tokens(block)
++                    if used + t <= budget:
++                        parts.append(block)
++                        used += t
++                if parts:
++                    ctx_blocks.append("\n".join(parts))
++            elif mtype == "sql" and not last_sql_added:
+                 sql_prev = (m.get("content") or "").strip()
+                 if sql_prev:
+-                    ctx.append(f"Assistente (SQL anterior):\n```sql\n{sql_prev}\n```")
+-            else:
++                    block = f"Assistente (SQL anterior):\n```sql\n{sql_prev}\n```"
++                    t = _approx_tokens(block)
++                    if used + t <= budget:
++                        ctx_blocks.append(block)
++                        used += t
++                        last_sql_added = True
++            elif mtype in (None, "text"):
+                 content = (m.get("content") or "").strip()
+                 if content:
+-                    ctx.append(f"Assistente: {content}")
+-
+-    return "\n\n".join(reversed(ctx))
++                    block = f"Assistente: {content}"
++                    t = _approx_tokens(block)
++                    if used + t <= budget:
++                        ctx_blocks.append(block)
++                        used += t
++
++    # reverte ordem para cronológico
++    ctx = "\n\n".join(reversed(user_turns_text) + list(reversed(ctx_blocks)))
++    return ctx
+ 
+ 
+ # Processamento do turno pendente
+@@ -221,7 +311,13 @@
+ if pending and pending["id"] > st.session_state.last_processed_turn_id:
+     q = pending["question"]
+     with st.chat_message("user", avatar=None): st.markdown(q)
+-    st.session_state.messages.append({"role": "user", "content": q})
++    st.session_state.messages.append({"role": "user", "type":"text", "content": q})
++        from config import PERSIST_TURNS
++        try:
++                if PERSIST_TURNS and st.session_state.conn_str:
++                insert_chat_turn(st.session_state.conn_str, st.session_state.session_id, "user", "text", q, None)
++        except Exception:
++            pass
+ 
+     with st.chat_message("assistant", avatar=None):
+         if not st.session_state.conn_str:
+@@ -237,7 +333,7 @@
+ 
+                 with st.spinner("Analisando dados..."):
+                     # app.py — dentro do with st.spinner("Analisando dados..."):
+-                    hist = build_chat_context(max_turns=3)  # últimos 3 turnos do usuário
++                    hist = build_chat_context(max_tokens=st.session_state.history_token_budget)  # últimos 3 turnos do usuário
+ 
+                     prompt = montar_prompt(
+                         pergunta_usuario=q,
+@@ -284,6 +380,12 @@
+                 sql1 = enforce_new_plants_sql(sql1, q)
+ 
+                 st.session_state.messages.append({"role": "assistant", "type": "sql", "content": sql1})
++                from config import PERSIST_TURNS
++                try:
++                    if PERSIST_TURNS and st.session_state.conn_str:
++                        insert_chat_turn(st.session_state.conn_str, st.session_state.session_id, "assistant", "sql", sql1, None)
++                except Exception:
++                    pass
+                 st.session_state.last_question_sql = {"q": q, "sql": sql1}
+ 
+                 ok1, msg1 = validate_sql(sql1)
+@@ -330,9 +432,22 @@
+                         "summary": summary_text
+                     })
+ 
++                    from config import PERSIST_TURNS
++                    try:
++                        if PERSIST_TURNS and st.session_state.conn_str:
++                            insert_chat_turn(st.session_state.conn_str, st.session_state.session_id, "assistant", "dataframe", "[[DF_ROWS:{} COLS:{}]]".format(nrows, ncols), summary_text)frame", f"shape={df.shape}", summary_text)
++                    except Exception:
++                        pass
++
+             except Exception as e:
+                 st.error(f"Erro geral: {e}")
+-                st.session_state.messages.append({"role": "assistant", "content": f"Erro geral: {e}"})
++                st.session_state.messages.append({"role": "assistant", "type":"text", "content": f"Erro geral: {e}"})
++                from config import PERSIST_TURNS
++                try:
++                        if PERSIST_TURNS and st.session_state.conn_str:
++                        insert_chat_turn(st.session_state.conn_str, st.session_state.session_id, "assistant", "text", f"Erro geral: {e}", None)
++                except Exception:
++                    pass
+ 
+     st.session_state.last_processed_turn_id = pending["id"]
+     st.session_state.pending_turn = None
+
+--- a/db.py
++++ b/db.py
+@@ -66,3 +66,36 @@
+     df = pd.read_sql(sql_text, conn)
+     conn.close()
+     return df
++
++
++# === Persistência leve do histórico (opcional) ===
++def ensure_chat_table(conn_str: str):
++    """Cria tabela de histórico se não existir (SQL Server)."""
++    ddl = dedent("""
++    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='chat_turns' AND xtype='U')
++    CREATE TABLE chat_turns (
++        id INT IDENTITY(1,1) PRIMARY KEY,
++        session_id NVARCHAR(64) NOT NULL,
++        ts DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
++        role NVARCHAR(16) NOT NULL,
++        type NVARCHAR(16) NULL,
++        content NVARCHAR(MAX) NULL,
++        summary NVARCHAR(MAX) NULL
++    );
++    """)
++    conn = try_connect(conn_str)
++    cur = conn.cursor()
++    cur.execute(ddl)
++    conn.commit()
++    conn.close()
++
++def insert_chat_turn(conn_str: str, session_id: str, role: str, mtype: str, content: str, summary: str=None):
++    ensure_chat_table(conn_str)
++    conn = try_connect(conn_str)
++    cur = conn.cursor()
++    cur.execute(
++        "INSERT INTO chat_turns (session_id, role, type, content, summary) VALUES (?, ?, ?, ?, ?)",
++        (session_id, role, mtype, content, summary)
++    )
++    conn.commit()
++    conn.close()
+
+--- a/config.py
++++ b/config.py
+@@ -151,3 +151,12 @@
+     "Quando a pergunta envolver clientes, use a coluna NOME_CLI.",
+     "Quando houver 'excluir/sem/excepto', filtre com NOME_CLI NOT LIKE '%<nome>%' (collate CI_AI).",
+ ]
++
++
++# Persistência opcional do histórico (salva cada turno em tabela chat_turns)
++PERSIST_TURNS = os.getenv("PERSIST_TURNS", "false").lower() in ("1","true","yes")
++# Orçamento padrão de tokens para histórico
++DEFAULT_HISTORY_TOKEN_BUDGET = int(os.getenv("HISTORY_TOKEN_BUDGET", "3000"))
++
++# Colunas sensíveis para mascaramento no mini-CSV do contexto
++PII_COLUMN_HINTS = ["NOME", "CLI", "EMAIL", "CPF", "CNPJ"]

@@ -1,0 +1,55 @@
+app.py
+
+Arquivo principal que roda no Streamlit.
+
+Monta a interface de chat e gerencia o estado da conversa.
+
+Recebe a pergunta, cria o prompt, chama o modelo LLaMA, extrai e ajusta a SQL.
+
+Valida e executa a consulta no SQL Server.
+
+Mostra resultados e permite feedback 👍/👎, salvando em arquivos de log.
+
+core/config.py
+
+Centraliza configurações e variáveis de ambiente.
+
+Servidor, banco, driver ODBC.
+
+Host/porta e parâmetros do LLaMA.
+
+Ano padrão (2025) e opções de interface (ex.: esconder SQL).
+
+Caminhos e inicialização dos arquivos de feedback.
+
+core/rules.py
+
+Define as regras de negócio e mapeamentos.
+
+Lista oficial de plantas e estados.
+
+SCHEMA_INFO com descrições das colunas da única tabela usada (BI_PEDIDOS_LAB).
+
+Mapeia palavras-chave para colunas:
+
+“valor” → VALOR_TOTAL
+
+“volume/m²” → AREA_VENDIDA
+
+“peso/kg” → PESO_ENTREGUE
+
+“cliente” → NOME_CLI
+
+Regras gerais para gerar SQL (apenas SELECT/CTE, usar CTEs, etc).
+
+core/examples.py
+
+Conjunto de poucos exemplos de pergunta→SQL.
+
+Ensina o modelo a lidar com casos importantes, como:
+
+Interseção de clientes entre plantas usando JOIN.
+
+Exclusões por nome de cliente com NOT LIKE.
+
+Ajuda a orientar a LLaMA a gerar SQL consistente e correta.
